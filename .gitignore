@@ -1,0 +1,17 @@
+# secrets
+.env
+
+# local caches
+data/raw/
+data/exports/
+data/external/
+db/
+*.db
+__pycache__/
+*.pyc
+
+# lambda build artifacts
+lambda/.venv/
+lambda/.python_packages/
+
+sql/
