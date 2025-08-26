@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 from pathlib import Path
 from urllib.request import urlopen
 from urllib.parse import quote
@@ -91,6 +93,79 @@ def melt_tpss_hourly(df_tpss: pd.DataFrame) -> pd.DataFrame:
     # 날짜 포맷
     df["기준_날짜"] = pd.to_datetime(df["date"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
     return df[["기준_날짜","rte_id","stop_id","stop_seq","시간","운행횟수"]]
+
+# -----------------------------
+# TPSS CSV 로드 헬퍼
+# -----------------------------
+def load_tpss_from_csv(csv_path, route_no: str, rte_id: str, yyyymmdd: str, route_map_csv=None) -> pd.DataFrame:
+    """
+    로컬 CSV(정류장별/시간대별 버스 운행횟수 피벗 형태)를 읽어
+    [기준_날짜, rte_id, stop_id, stop_seq, 시간, 운행횟수] Long 형태로 변환.
+    CSV 기대 컬럼 예:
+      - 기준_날짜 (YYYYMMDD)
+      - 노선_ID
+      - 정류장_ID
+      - 버스운행횟수_일
+      - 버스운행횟수_00시 ... 버스운행횟수_23시
+      - 정류장_순서
+    """
+    df = pd.read_csv(csv_path, dtype=str)
+    # 날짜 필터
+    df = df[df["기준_날짜"] == yyyymmdd].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["기준_날짜","rte_id","stop_id","stop_seq","시간","운행횟수"])
+
+    # route_key(노선_ID) 매핑: route_map_csv에서 (RTE_NO, RTE_ID) → 노선_ID
+    route_key = None
+    if route_map_csv:
+        try:
+            rm = pd.read_csv(route_map_csv, dtype=str)
+            hit = rm[(rm["RTE_NO"].astype(str) == str(route_no)) & (rm["RTE_ID"].astype(str) == str(rte_id))]
+            if not hit.empty:
+                route_key = hit.iloc[0]["노선_ID"]
+        except FileNotFoundError:
+            route_key = None
+        except Exception:
+            route_key = None
+
+    if route_key is not None:
+        df = df[df["노선_ID"].astype(str) == str(route_key)].copy()
+
+    # 시간 컬럼 수집
+    hour_cols = [c for c in df.columns if c.startswith("버스운행횟수_") and c.endswith("시")]
+    # 안전하게 00~23시만 정렬
+    def _hkey(c): 
+        try:
+            return int(c.split("_")[-1].replace("시",""))
+        except:
+            return 99
+    hour_cols = sorted(hour_cols, key=_hkey)
+
+    # 결측/빈칸 → 0
+    for c in hour_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # melt
+    long_df = df.melt(
+        id_vars=["기준_날짜","정류장_ID","정류장_순서"],
+        value_vars=hour_cols,
+        var_name="hour_tag", value_name="운행횟수"
+    )
+    long_df["시간"] = long_df["hour_tag"].str.extract(r"(\d+)").astype(int)
+    long_df = long_df.drop(columns=["hour_tag"])
+
+    # 형식 맞추기
+    long_df = long_df.rename(columns={"정류장_ID":"stop_id","정류장_순서":"stop_seq"})
+    long_df["rte_id"] = str(rte_id)
+    # 날짜 포맷 변경
+    long_df["기준_날짜"] = pd.to_datetime(long_df["기준_날짜"], format="%Y%m%d").dt.strftime("%Y-%m-%d")
+
+    # 열 정리/순서
+    long_df = long_df[["기준_날짜","rte_id","stop_id","stop_seq","시간","운행횟수"]].copy()
+    # 타입 정리
+    long_df["stop_seq"] = pd.to_numeric(long_df["stop_seq"], errors="coerce")
+    long_df["운행횟수"] = pd.to_numeric(long_df["운행횟수"], errors="coerce").fillna(0).astype(int)
+    return long_df
 
 # -----------------------------
 # 2) CardBusStatisticsServiceNew (일별 정류장 총 승/하차 + 정류장명)
@@ -342,6 +417,30 @@ def upsert_dim_stop_link_sqlite(conn, link_csv: Path):
     cur.executemany(sql, data)
     conn.commit()
 
+def upsert_dim_stop_link_from_master_sqlite(conn, stop_master_df: pd.DataFrame, route_key: str | None):
+    if stop_master_df is None or stop_master_df.empty:
+        return
+    df = stop_master_df.copy()
+    # 기대 컬럼: route_key(없으면 채움), stop_id, link_distance_m, link_stop_seq
+    if "stop_id" not in df.columns or "link_stop_seq" not in df.columns:
+        return
+    if "link_distance_m" not in df.columns:
+        return
+    if "route_key" not in df.columns:
+        df["route_key"] = route_key if route_key is not None else None
+    df = df.dropna(subset=["stop_id","link_stop_seq"])
+    tuples = list(df[["route_key","stop_id","link_distance_m","link_stop_seq"]]
+                    .rename(columns={"link_stop_seq":"stop_seq"})
+                    .itertuples(index=False, name=None))
+    if not tuples:
+        return
+    sql = """
+    INSERT OR REPLACE INTO dim_stop_link (route_key, stop_id, link_distance_m, stop_seq)
+    VALUES (?, ?, ?, ?)
+    """
+    conn.executemany(sql, tuples)
+    conn.commit()
+
 def upsert_fact_demand_daily_sqlite(conn, df_daily: pd.DataFrame):
     if df_daily is None or df_daily.empty:
         return
@@ -477,6 +576,56 @@ def load_route_map(route_map_csv: Path) -> pd.DataFrame:
     df["RTE_NO"] = df["RTE_NO"].astype(str)
     return df
 
+def load_stop_master(stop_master_csv: Path, route_no: str, rte_id: str, yyyymmdd: str) -> pd.DataFrame:
+    """
+    유연 로더: 열 이름이 달라도 최대한 매칭.
+    반환 컬럼: ['route_key','stop_id','link_distance_m','link_stop_seq']
+    날짜 컬럼이 있으면 YYYYMMDD(예: 20250801)로 필터링.
+    """
+    if not stop_master_csv or not Path(stop_master_csv).exists():
+        return pd.DataFrame(columns=["route_key","stop_id","link_distance_m","link_stop_seq"])
+
+    df = pd.read_csv(stop_master_csv, dtype=str)
+
+    def pick(*names):
+        for n in names:
+            if n in df.columns:
+                return n
+        return None
+
+    col_route_key = pick("노선_ID","ROUTE_KEY","ROUTE_ID")
+    col_rte_id    = pick("RTE_ID","노선아이디")
+    col_route_no  = pick("RTE_NO","노선번호","ROUTE_NO")
+    col_stop_id   = pick("정류장_ID","STOPS_ID","STOP_ID")
+    col_stop_seq  = pick("정류장_순서","STOPS_SEQ","STOP_SEQ")
+    col_dist      = pick("링크_구간거리(m)","LINK_DISTANCE_M","링크거리","LINK_DIST_M")
+    col_date      = pick("CRTR_DD","기준_날짜","DATE")
+
+    if col_stop_id is None or col_stop_seq is None:
+        return pd.DataFrame(columns=["route_key","stop_id","link_distance_m","link_stop_seq"])
+
+    # 날짜 필터(있으면)
+    if col_date is not None:
+        d = df[col_date].astype(str).str.replace(r"[^0-9]","", regex=True)
+        df = df[d == str(yyyymmdd)]
+
+    # 노선 필터(가능하면)
+    if col_rte_id is not None:
+        df = df[df[col_rte_id].astype(str) == str(rte_id)]
+    elif col_route_no is not None:
+        df = df[df[col_route_no].astype(str) == str(route_no)]
+
+    if df.empty:
+        return pd.DataFrame(columns=["route_key","stop_id","link_distance_m","link_stop_seq"])
+
+    out = pd.DataFrame()
+    out["route_key"] = df[col_route_key].astype(str) if col_route_key else None
+    out["stop_id"] = df[col_stop_id].astype(str)
+    out["link_stop_seq"] = pd.to_numeric(df[col_stop_seq], errors="coerce")
+    out["link_distance_m"] = pd.to_numeric(df[col_dist], errors="coerce") if col_dist else pd.NA
+    out = out.dropna(subset=["stop_id","link_stop_seq"])
+    return out
+
 # -----------------------------
 # 메인 조립
 # -----------------------------
@@ -488,10 +637,14 @@ def main():
     ap.add_argument("--rte-id", required=True, help="RTE_ID (예: 11110028)")
     ap.add_argument("--date", required=True, help="YYYYMMDD (예: 20250601)")
     ap.add_argument("--month", required=True, help="YYYYMM (예: 202506)")
-    ap.add_argument("--link-csv", required=True, help="노선_ID,정류장_ID,링크_구간거리(m),정류장_순서 CSV")
-    ap.add_argument("--route-map-csv", required=True, help="노선_ID,RTE_ID,RTE_NO 매핑 CSV")
+    ap.add_argument("--link-csv", default=None,
+                help="(선택) 노선_ID,정류장_ID,링크_구간거리(m),정류장_순서 CSV. stop-master에 링크거리가 있으면 생략 가능")
+    ap.add_argument("--stop-master-csv", default=None,
+                help="(선택) 노선 정류장 마스터 CSV 경로 (노선_ID, 정류장_ID, 정류장_순서, [링크_구간거리(m)], [CRTR_DD] 포함 가능)")
+    ap.add_argument("--route-map-csv", default=None, help="(선택) 노선_ID=RTE_ID 가정 시 불필요. 제공 시 노선_ID,RTE_ID,RTE_NO 매핑 CSV")
     ap.add_argument("--db-path", required=True, help="SQLite DB file path")
     ap.add_argument("--db-table", default="daily_stop_hour", help="Target table name (default: daily_stop_hour)")
+    ap.add_argument("--tpss-csv", default=None, help="(선택) tpssStationRouteTurn을 대신할 로컬 CSV 경로")
     ap.add_argument("--out-csv", default=None)
     args = ap.parse_args()
 
@@ -500,7 +653,13 @@ def main():
 
     d_yyyy_mm_dd = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
 
-    # 1) TPS스(대용량) 수집 or 로드 from DB
+    # 노선_ID == RTE_ID 가정 (서울시 내 통일)
+    route_key = str(args.rte_id)
+    route_map = pd.DataFrame()  # 매핑 CSV 없이 진행
+    # Prefer stop-master for link/sequence if provided (date-filtered)
+    stop_master_df = load_stop_master(Path(args.stop_master_csv), args.route_no, args.rte_id, args.date) if args.stop_master_csv else pd.DataFrame()
+
+    # 1) TPS스(대용량) 수집/로드
     conn = connect_sqlite(db_path)
     # Ensure fact_ops_hourly_stop exists
     conn.execute("""
@@ -514,23 +673,37 @@ def main():
       UNIQUE (date, rte_id, stop_id, hour)
     );
     """)
-    # Check if data for this date+rte_id exists
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(1) FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?", (datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d"), str(args.rte_id)))
-    tpss_exists = cur.fetchone()[0] > 0
-    if tpss_exists:
-        # Load from DB
-        tpss_long = pd.read_sql_query(
-            "SELECT date as 기준_날짜, rte_id, stop_id, stop_seq, hour as 시간, ops as 운행횟수 FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?",
-            conn,
-            params=(datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d"), str(args.rte_id))
-        )
+
+    yyyy_mm_dd_str = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
+
+    if args.tpss_csv:
+        # 🚀 빠른 경로: 로컬 CSV 사용
+        tpss_long = load_tpss_from_csv(args.tpss_csv, args.route_no, args.rte_id, args.date, args.route_map_csv)
+        if tpss_long.empty:
+            print("[warn] TPSS CSV에서 해당 날짜/노선 데이터를 찾지 못했습니다.")
+        else:
+            upsert_fact_ops_hourly_sqlite(conn, tpss_long)
     else:
-        # Fetch from API, process, and store in DB
-        tpss_raw = fetch_tpss_for_date(args.tpss_key, args.date, Path("data/raw/api/tpss"))
-        tpss_raw = tpss_raw[tpss_raw["rte_id"].astype(str) == str(args.rte_id)]
-        tpss_long = melt_tpss_hourly(tpss_raw)  # [기준_날짜, rte_id, stop_id, stop_seq, 시간, 운행횟수]
-        upsert_fact_ops_hourly_sqlite(conn, tpss_long)
+        # 기존 경로: API 호출 → DB 캐시
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(1) FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?", (yyyy_mm_dd_str, str(args.rte_id)))
+        tpss_exists = cur.fetchone()[0] > 0
+        if tpss_exists:
+            # Load from DB
+            tpss_long = pd.read_sql_query(
+                "SELECT date as 기준_날짜, rte_id, stop_id, stop_seq, hour as 시간, ops as 운행횟수 FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?",
+                conn, params=(yyyy_mm_dd_str, str(args.rte_id))
+            )
+        else:
+            # Fetch from API, process, and store in DB
+            tpss_raw = fetch_tpss_for_date(args.tpss_key, args.date, Path('data/raw/api/tpss'))
+            tpss_raw = tpss_raw[tpss_raw['rte_id'].astype(str) == str(args.rte_id)]
+            tpss_long = melt_tpss_hourly(tpss_raw)
+            upsert_fact_ops_hourly_sqlite(conn, tpss_long)
+
+    # ---- Hard filter to the single target route (rte_id) ----
+    if 'tpss_long' in locals() and tpss_long is not None and not tpss_long.empty:
+        tpss_long = tpss_long[tpss_long['rte_id'].astype(str) == str(args.rte_id)]
 
     # 2) 일별 정류장 총 승/하차 + 정류장명
     daily_stats = fetch_daily_stats_for_route(args.stats_key, args.date, args.route_no, Path("data/raw/api/CardBusStatisticsServiceNew"))
@@ -538,18 +711,16 @@ def main():
     monthly = fetch_monthly_time_for_route(args.stats_key, args.month, args.route_no, Path("data/raw/api/CardBusTimeNew"))
     weights = build_hour_weights(monthly)  # [route_no, stop_id, 시간, w_board, w_alight]
 
-    # 4) 링크거리 & 라우트 매핑
-    link_df = load_link_distance(Path(args.link_csv))  # [노선_ID, stop_id, link_distance_m, link_stop_seq]
-    route_map = load_route_map(Path(args.route_map_csv))  # [노선_ID, RTE_ID, RTE_NO]
+    # 4) 링크거리 & 라우트 매핑 (stop-master 우선, 없으면 link-csv)
+    if stop_master_df is not None and not stop_master_df.empty:
+        # stop_master_df columns: route_key, stop_id, link_distance_m, link_stop_seq
+        link_df = stop_master_df.copy()
+    else:
+        # fallback to legacy link CSV (노선_ID, 정류장_ID, 링크_구간거리(m), 정류장_순서)
+        link_df = load_link_distance(Path(args.link_csv))  # returns: [노선_ID, stop_id, link_distance_m, link_stop_seq]
 
-    # 이 노선의 노선_ID 찾기
-    route_key = None
-    if not route_map.empty:
-        m = route_map[(route_map["RTE_ID"]==str(args.rte_id)) & (route_map["RTE_NO"]==str(args.route_no))]
-        if not m.empty:
-            route_key = m.iloc[0]["노선_ID"]
-    if route_key is None:
-        print("[warn] route_key(노선_ID)를 route_map에서 찾지 못했어요. 링크거리 조인은 skip(또는 직접 --route-id 추가 구현).")
+    # route_key는 RTE_ID와 동일하게 사용
+    # route_key = str(args.rte_id)
 
     # 5) 조립: fact_ops_hourly_stop(시간대 운행횟수) + 일별 총량 + 월 가중치
     #    - 시간 단위에 승/하차 분배
@@ -560,8 +731,16 @@ def main():
         return
 
     # 정류장명(일별) 붙이기
-    name_map = daily_stats[["기준_날짜","stop_id","stop_name","route_no"]].drop_duplicates() if not daily_stats.empty else pd.DataFrame(columns=["기준_날짜","stop_id","stop_name","route_no"])
+    name_map = (
+        daily_stats[["기준_날짜","stop_id","stop_name","route_no"]].drop_duplicates()
+        if not daily_stats.empty
+        else pd.DataFrame(columns=["기준_날짜","stop_id","stop_name","route_no"])
+    )
     df = tpss_long.merge(name_map, on=["기준_날짜","stop_id"], how="left")
+
+    # ---- Hard filter to single route: route_no & rte_id ----
+    df["route_no"] = str(args.route_no)  # 보정
+    df = df[(df["rte_id"].astype(str) == str(args.rte_id)) & (df["route_no"].astype(str) == str(args.route_no))]
 
     # 일별 총량 붙이기
     daily_map = daily_stats[["기준_날짜","stop_id","board_total_day","alight_total_day"]].drop_duplicates() if not daily_stats.empty else None
@@ -571,11 +750,32 @@ def main():
         df["board_total_day"] = 0
         df["alight_total_day"] = 0
 
-    # 월 가중치 붙이기 (route_no는 문자열로 정규화)
+    # --- 월 가중치 준비 (빈 경우/route_no 누락 시 균등 가중치 생성) ---
+    weights = build_hour_weights(monthly)  # 기대 스키마: [route_no, stop_id, 시간, w_board, w_alight]
+
+    # 월 가중치가 비었거나, route_no 컬럼이 없거나, 키가 맞지 않으면 균등(1/24)로 생성
+    if (weights is None) or weights.empty or ("stop_id" not in weights.columns) or ("시간" not in weights.columns):
+        # tpss_long에서 사용되는 정류장과 0~23시간을 기준으로 균등 가중치 구성
+        stops = sorted(tpss_long["stop_id"].astype(str).unique().tolist()) if not tpss_long.empty else []
+        hours = list(range(24))
+        weights = pd.DataFrame(
+            [(str(args.route_no), s, h, 1/24, 1/24) for s in stops for h in hours],
+            columns=["route_no","stop_id","시간","w_board","w_alight"]
+        )
+    else:
+        # 타입 정규화: 존재하는 컬럼만 안전하게 캐스팅
+        if "route_no" in weights.columns:
+            weights["route_no"] = weights["route_no"].astype(str)
+        weights["stop_id"] = weights["stop_id"].astype(str)
+
+    # 월 가중치 붙이기 (route_no가 있으면 route_no도 키로, 없으면 stop_id+시간만)
     df["route_no"] = str(args.route_no)
-    weights["route_no"] = weights["route_no"].astype(str)
-    df = df.merge(weights, on=["route_no","stop_id","시간"], how="left")
-    # 가중치가 없는 경우 균등 분배
+    if "route_no" in weights.columns:
+        df = df.merge(weights, on=["route_no","stop_id","시간"], how="left")
+    else:
+        df = df.merge(weights[["stop_id","시간","w_board","w_alight"]], on=["stop_id","시간"], how="left")
+
+    # 가중치가 없는 경우(merge 후 결측)도 균등 분배
     df["w_board"] = df["w_board"].fillna(1/24)
     df["w_alight"] = df["w_alight"].fillna(1/24)
 
@@ -585,19 +785,44 @@ def main():
 
     # 링크거리 붙이기 (가능하면)
     if route_key is not None:
-        link_sub = link_df[link_df["노선_ID"] == str(route_key)].copy()
+        # route_key 컬럼명 차이를 흡수
+        if "route_key" in link_df.columns:
+            link_sub = link_df[link_df["route_key"].astype(str) == str(route_key)].copy()
+        elif "노선_ID" in link_df.columns:
+            link_sub = link_df[link_df["노선_ID"].astype(str) == str(route_key)].copy()
+        else:
+            link_sub = link_df.copy()
+
         # 우선 stop_id로 붙이고, 없으면 seq로 보조 매칭
-        df = df.merge(link_sub[["stop_id","link_distance_m"]], on="stop_id", how="left")
+        if "stop_id" in link_sub.columns:
+            df = df.merge(link_sub[["stop_id","link_distance_m"]], on="stop_id", how="left")
         # 보조: stop_seq == link_stop_seq로 매칭 (아직 빈 곳만)
-        if "link_distance_m" in df.columns:
-            missing = df["link_distance_m"].isna()
-            if missing.any():
-                df2 = df[missing].merge(link_sub[["link_stop_seq","link_distance_m"]], left_on="stop_seq", right_on="link_stop_seq", how="left")
-                df.loc[missing, "link_distance_m"] = df2["link_distance_m"].values
+        # link_distance_m 컬럼이 없다면 만들어 둔다
+        if "link_distance_m" not in df.columns:
+            df["link_distance_m"] = pd.NA
+        missing = df["link_distance_m"].isna()
+        if missing.any() and "link_stop_seq" in link_sub.columns:
+            # 안전한 매핑: link_stop_seq → link_distance_m (중복은 평균 처리)
+            tmp_map = (
+                link_sub[["link_stop_seq", "link_distance_m"]]
+                .dropna(subset=["link_stop_seq"])
+                .copy()
+            )
+            # 타입 정규화
+            tmp_map["link_stop_seq"] = pd.to_numeric(tmp_map["link_stop_seq"], errors="coerce")
+            # 평균값으로 중복 축약
+            seq2dist = tmp_map.groupby("link_stop_seq")["link_distance_m"].mean()
+            # 결측 대상에만 매핑
+            df.loc[missing, "link_distance_m"] = df.loc[missing, "stop_seq"].map(seq2dist)
+
         # 노선ID 컬럼 추가
         df["노선ID"] = str(route_key)
     else:
-        df["link_distance_m"] = None
+        # route_key를 찾지 못한 경우라도 stop_id 기준으로만 시도
+        if "stop_id" in link_df.columns and "link_distance_m" in link_df.columns:
+            df = df.merge(link_df[["stop_id","link_distance_m"]], on="stop_id", how="left")
+        if "link_distance_m" not in df.columns:
+            df["link_distance_m"] = pd.NA
         df["노선ID"] = None
 
     # 최종 컬럼 구성/정렬
@@ -620,14 +845,35 @@ def main():
 
     # ---- Save to DB (normalized + flat) ----
     create_dim_fact_tables_sqlite(conn)
-    upsert_dim_route_map_sqlite(conn, Path(args.route_map_csv))
-    upsert_dim_stop_link_sqlite(conn, Path(args.link_csv))
+    # route_map CSV가 없더라도 노선_ID == RTE_ID 가정으로 dim_route_map에 직접 upsert
+    if args.route_map_csv and Path(args.route_map_csv).exists():
+        upsert_dim_route_map_sqlite(conn, Path(args.route_map_csv))
+    else:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS dim_route_map (
+          route_key TEXT PRIMARY KEY,
+          rte_id    TEXT NOT NULL,
+          route_no  TEXT NOT NULL
+        );
+        """)
+        conn.execute("INSERT OR REPLACE INTO dim_route_map (route_key, rte_id, route_no) VALUES (?, ?, ?)",
+                     (str(args.rte_id), str(args.rte_id), str(args.route_no)))
+        conn.commit()
+    # Prefer stop-master for link/sequence if available; otherwise fallback to --link-csv
+    if stop_master_df is not None and not stop_master_df.empty:
+        upsert_dim_stop_link_from_master_sqlite(conn, stop_master_df, route_key)
+    elif args.link_csv:
+        upsert_dim_stop_link_sqlite(conn, Path(args.link_csv))
     upsert_fact_demand_daily_sqlite(conn, daily_stats)
     upsert_fact_demand_monthly_hourly_sqlite(conn, monthly)
     create_flat_table_if_not_exists(conn, db_table)
     upsert_dataframe(conn, db_table, df)
+    affected = len(df)
     conn.close()
-    print(f"✅ upserted {len(df):,} rows into `{db_table}` and refreshed normalized tables in SQLite DB {db_path}")
+    if affected > 0:
+        print(f"✅ upserted {affected:,} rows into `{db_table}` and refreshed normalized tables in SQLite DB {db_path}")
+    else:
+        print("⚠️ 생성된 행이 없습니다. 입력 데이터/필터(날짜, 노선)를 확인하세요.")
 
     # ---- Save to CSV (optional) ----
     if args.out_csv:
