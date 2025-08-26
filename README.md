@@ -43,8 +43,8 @@
 
 결과 예시
 
+<img width="652" height="402" alt="스크린샷 2025-08-26 오전 10 57 24" src="https://github.com/user-attachments/assets/26f4f1da-c479-4317-ad86-936eed5ff709" />
 
-<img width="323" height="353" alt="스크린샷 2025-08-26 오전 2 07 11" src="https://github.com/user-attachments/assets/de5d8c4a-4d8c-4c0d-9844-d288c9e49628" />
 
 - 의미: 원정류장 출발 기준으로 from_hour 출발 버스(또는 대수)를 혼잡 시간대(to_hour)로 이동.
 - 실제 대시보드에서는 시간대별 현재/권장 출발 대수와 권장 헤드웨이(분) 변화를 함께 보여줍니다.
