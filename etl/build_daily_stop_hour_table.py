@@ -6,7 +6,8 @@ from urllib.parse import quote
 import xml.etree.ElementTree as ET
 import pandas as pd
 from datetime import datetime
-import pymysql
+import sqlite3
+import os
 
 def q(x):  # URL 세그먼트 안전 인코딩
     return quote(str(x), safe="")
@@ -17,6 +18,11 @@ def fetch(url: str) -> str:
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+
+# 환경변수 읽기 유틸
+def getenv_default(name: str, default=None):
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
 
 # -----------------------------
 # 1) tpssStationRouteTurn (대용량, 날짜만 파라미터 / route 필터는 로컬에서)
@@ -168,38 +174,84 @@ def build_hour_weights(df_m: pd.DataFrame) -> pd.DataFrame:
     return df[["route_no","stop_id","시간","w_board","w_alight"]]
 
 # -----------------------------
-# DB helpers (MySQL/Aurora)
+# DB helpers (SQLite)
 # -----------------------------
-def connect_mysql(host: str, port: int, user: str, password: str, db: str):
-    return pymysql.connect(
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=db,
-        charset="utf8mb4",
-        autocommit=False,
-    )
+def connect_sqlite(db_path: str):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+def create_dim_fact_tables_sqlite(conn):
+    # Create tables with SQLite syntax
+    ddl = [
+        """
+        CREATE TABLE IF NOT EXISTS dim_route_map (
+          route_key TEXT PRIMARY KEY,
+          rte_id    TEXT NOT NULL,
+          route_no  TEXT NOT NULL
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS dim_stop_link (
+          route_key TEXT NOT NULL,
+          stop_id   TEXT NOT NULL,
+          link_distance_m REAL,
+          stop_seq  INTEGER,
+          PRIMARY KEY(route_key, stop_id, stop_seq)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fact_demand_daily_stop (
+          date TEXT NOT NULL,
+          rte_id TEXT,
+          route_no TEXT,
+          stop_id TEXT,
+          stop_name TEXT,
+          board_total INTEGER,
+          alight_total INTEGER,
+          reg_ymd TEXT,
+          UNIQUE (date, route_no, stop_id)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS fact_demand_monthly_hourly_stop (
+          use_ym TEXT NOT NULL,
+          route_no TEXT,
+          stop_id TEXT,
+          stop_name TEXT,
+          hour INTEGER,
+          board_total INTEGER,
+          alight_total INTEGER,
+          reg_ymd TEXT,
+          UNIQUE (use_ym, route_no, stop_id, hour)
+        );
+        """
+    ]
+    cur = conn.cursor()
+    for stmt in ddl:
+        cur.execute(stmt)
+    conn.commit()
 
 def create_flat_table_if_not_exists(conn, table: str):
+    # Flat table for final output (SQLite syntax)
     ddl = f"""
-    CREATE TABLE IF NOT EXISTS `{table}` (
-      `기준_날짜` DATE NOT NULL,
-      `노선ID` VARCHAR(64),
-      `정류장_ID` VARCHAR(64) NOT NULL,
-      `시간` TINYINT UNSIGNED NOT NULL,
-      `승차인원` DOUBLE,
-      `하차인원` DOUBLE,
-      `노선번호` VARCHAR(32),
-      `역명` VARCHAR(255),
-      `정류장_순서` INT,
-      `운행횟수` INT,
-      `링크_구간거리(m)` DOUBLE,
-      UNIQUE KEY uq1 (`기준_날짜`,`정류장_ID`,`시간`)
-    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE TABLE IF NOT EXISTS {table} (
+      기준_날짜 TEXT NOT NULL,
+      노선ID TEXT,
+      정류장_ID TEXT NOT NULL,
+      시간 INTEGER NOT NULL,
+      승차인원 REAL,
+      하차인원 REAL,
+      노선번호 TEXT,
+      역명 TEXT,
+      정류장_순서 INTEGER,
+      운행횟수 INTEGER,
+      링크_구간거리_m REAL,
+      UNIQUE (기준_날짜, 노선번호, 정류장_ID, 시간)
+    );
     """
-    with conn.cursor() as cur:
-        cur.execute(ddl)
+    cur = conn.cursor()
+    cur.execute(ddl)
     conn.commit()
 # -----------------------------
 # 4) 링크거리 & 노선ID 매핑
@@ -257,42 +309,40 @@ def create_dim_fact_tables_mysql(conn):
                 cur.execute(s + ";")
     conn.commit()
 
-def upsert_dim_route_map_mysql(conn, route_map_csv: Path):
+# SQLite upsert helpers
+def upsert_dim_route_map_sqlite(conn, route_map_csv: Path):
     if not route_map_csv.exists():
         print(f"[warn] route map CSV not found: {route_map_csv} (skip)")
         return
     df = pd.read_csv(route_map_csv)
-    # 기대 컬럼: 노선_ID, RTE_ID, RTE_NO
     df = df.rename(columns={"노선_ID":"route_key", "RTE_ID":"rte_id", "RTE_NO":"route_no"})
     df["route_key"] = df["route_key"].astype(str)
     df["rte_id"] = df["rte_id"].astype(str)
     df["route_no"] = df["route_no"].astype(str)
     sql = """
-    INSERT INTO dim_route_map (route_key, rte_id, route_no)
-    VALUES (%s, %s, %s)
-    ON DUPLICATE KEY UPDATE rte_id=VALUES(rte_id), route_no=VALUES(route_no);
+    INSERT OR REPLACE INTO dim_route_map (route_key, rte_id, route_no)
+    VALUES (?, ?, ?)
     """
     data = list(df[["route_key","rte_id","route_no"]].itertuples(index=False, name=None))
-    with conn.cursor() as cur:
-        cur.executemany(sql, data)
+    cur = conn.cursor()
+    cur.executemany(sql, data)
     conn.commit()
 
-def upsert_dim_stop_link_mysql(conn, link_csv: Path):
+def upsert_dim_stop_link_sqlite(conn, link_csv: Path):
     df = pd.read_csv(link_csv)
     df = df.rename(columns={"노선_ID":"route_key","정류장_ID":"stop_id","링크_구간거리(m)":"link_distance_m","정류장_순서":"stop_seq"})
     df["route_key"] = df["route_key"].astype(str)
     df["stop_id"] = df["stop_id"].astype(str)
     sql = """
-    INSERT INTO dim_stop_link (route_key, stop_id, link_distance_m, stop_seq)
-    VALUES (%s, %s, %s, %s)
-    ON DUPLICATE KEY UPDATE link_distance_m=VALUES(link_distance_m), stop_seq=VALUES(stop_seq);
+    INSERT OR REPLACE INTO dim_stop_link (route_key, stop_id, link_distance_m, stop_seq)
+    VALUES (?, ?, ?, ?)
     """
     data = list(df[["route_key","stop_id","link_distance_m","stop_seq"]].itertuples(index=False, name=None))
-    with conn.cursor() as cur:
-        cur.executemany(sql, data)
+    cur = conn.cursor()
+    cur.executemany(sql, data)
     conn.commit()
 
-def upsert_fact_demand_daily_mysql(conn, df_daily: pd.DataFrame):
+def upsert_fact_demand_daily_sqlite(conn, df_daily: pd.DataFrame):
     if df_daily is None or df_daily.empty:
         return
     tmp = df_daily.rename(columns={
@@ -305,28 +355,21 @@ def upsert_fact_demand_daily_mysql(conn, df_daily: pd.DataFrame):
         "alight_total_day":"alight_total",
         "reg_ymd":"reg_ymd"
     }).copy()
-    # reg_ymd를 DATE 포맷으로 맞추기 (yyyy-mm-dd) 실패 시 NULL
     try:
         tmp["reg_ymd"] = pd.to_datetime(tmp["reg_ymd"], format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
     except Exception:
         pass
     sql = """
-    INSERT INTO fact_demand_daily_stop
+    INSERT OR REPLACE INTO fact_demand_daily_stop
     (date, rte_id, route_no, stop_id, stop_name, board_total, alight_total, reg_ymd)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-    ON DUPLICATE KEY UPDATE
-      rte_id=VALUES(rte_id),
-      stop_name=VALUES(stop_name),
-      board_total=VALUES(board_total),
-      alight_total=VALUES(alight_total),
-      reg_ymd=VALUES(reg_ymd);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     data = list(tmp[["date","rte_id","route_no","stop_id","stop_name","board_total","alight_total","reg_ymd"]].itertuples(index=False, name=None))
-    with conn.cursor() as cur:
-        cur.executemany(sql, data)
+    cur = conn.cursor()
+    cur.executemany(sql, data)
     conn.commit()
 
-def upsert_fact_demand_monthly_hourly_mysql(conn, df_monthly: pd.DataFrame):
+def upsert_fact_demand_monthly_hourly_sqlite(conn, df_monthly: pd.DataFrame):
     if df_monthly is None or df_monthly.empty:
         return
     tmp = df_monthly.rename(columns={
@@ -344,18 +387,47 @@ def upsert_fact_demand_monthly_hourly_mysql(conn, df_monthly: pd.DataFrame):
     except Exception:
         pass
     sql = """
-    INSERT INTO fact_demand_monthly_hourly_stop
+    INSERT OR REPLACE INTO fact_demand_monthly_hourly_stop
     (use_ym, route_no, stop_id, stop_name, hour, board_total, alight_total, reg_ymd)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-    ON DUPLICATE KEY UPDATE
-      stop_name=VALUES(stop_name),
-      board_total=VALUES(board_total),
-      alight_total=VALUES(alight_total),
-      reg_ymd=VALUES(reg_ymd);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
     data = list(tmp[["use_ym","route_no","stop_id","stop_name","hour","board_total","alight_total","reg_ymd"]].itertuples(index=False, name=None))
-    with conn.cursor() as cur:
-        cur.executemany(sql, data)
+    cur = conn.cursor()
+    cur.executemany(sql, data)
+    conn.commit()
+
+def upsert_fact_ops_hourly_sqlite(conn, df_tpss: pd.DataFrame):
+    """
+    Store hourly ops data from tpss_long into fact_ops_hourly_stop table.
+    """
+    if df_tpss is None or df_tpss.empty:
+        return
+    tmp = df_tpss.rename(columns={
+        "기준_날짜":"date",
+        "rte_id":"rte_id",
+        "stop_id":"stop_id",
+        "stop_seq":"stop_seq",
+        "시간":"hour",
+        "운행횟수":"ops"
+    }).copy()
+    sql = """
+    CREATE TABLE IF NOT EXISTS fact_ops_hourly_stop (
+      date TEXT NOT NULL,
+      rte_id TEXT,
+      stop_id TEXT,
+      stop_seq INTEGER,
+      hour INTEGER,
+      ops INTEGER,
+      UNIQUE (date, rte_id, stop_id, hour)
+    );
+    """
+    conn.execute(sql)
+    data = list(tmp[["date","rte_id","stop_id","stop_seq","hour","ops"]].itertuples(index=False, name=None))
+    conn.executemany("""
+      INSERT OR REPLACE INTO fact_ops_hourly_stop
+      (date, rte_id, stop_id, stop_seq, hour, ops)
+      VALUES (?, ?, ?, ?, ?, ?)
+    """, data)
     conn.commit()
 
 def upsert_dataframe(conn, table: str, df: pd.DataFrame):
@@ -368,24 +440,19 @@ def upsert_dataframe(conn, table: str, df: pd.DataFrame):
     # Replace NaN with None for DB insertion
     df2 = df[cols].where(pd.notnull(df[cols]), None)
 
-    placeholders = ", ".join(["%s"] * len(cols))
-    col_list = ", ".join([f"`{c}`" for c in cols])
+    # Rename column for SQLite compatibility (링크_구간거리(m) → 링크_구간거리_m)
+    insert_cols = [c if c != "링크_구간거리(m)" else "링크_구간거리_m" for c in cols]
+    col_list = ", ".join(insert_cols)
+    placeholders = ", ".join(["?"] * len(cols))
 
-    # Non-unique columns to update on conflict
-    update_cols = [
-        "노선ID","승차인원","하차인원","노선번호","역명",
-        "정류장_순서","운행횟수","링크_구간거리(m)"
-    ]
-    update_clause = ", ".join([f"`{c}`=VALUES(`{c}`)" for c in update_cols])
-
-    sql = f"INSERT INTO `{table}` ({col_list}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause};"
-
-    data = [tuple(row[c] for c in cols) for _, row in df2.iterrows()]
+    # Data for upsert: rename column in DataFrame for SQLite
+    df2 = df2.rename(columns={"링크_구간거리(m)": "링크_구간거리_m"})
+    data = [tuple(row[c if c != "링크_구간거리(m)" else "링크_구간거리_m"] for c in cols) for _, row in df2.iterrows()]
     if not data:
         return
-
-    with conn.cursor() as cur:
-        cur.executemany(sql, data)
+    sql = f"INSERT OR REPLACE INTO {table} ({col_list}) VALUES ({placeholders})"
+    cur = conn.cursor()
+    cur.executemany(sql, data)
     conn.commit()
 
 # -----------------------------
@@ -423,21 +490,47 @@ def main():
     ap.add_argument("--month", required=True, help="YYYYMM (예: 202506)")
     ap.add_argument("--link-csv", required=True, help="노선_ID,정류장_ID,링크_구간거리(m),정류장_순서 CSV")
     ap.add_argument("--route-map-csv", required=True, help="노선_ID,RTE_ID,RTE_NO 매핑 CSV")
-    ap.add_argument("--db-host", help="MySQL/Aurora host")
-    ap.add_argument("--db-port", type=int, default=3306, help="MySQL/Aurora port (default: 3306)")
-    ap.add_argument("--db-user", help="DB user")
-    ap.add_argument("--db-pass", help="DB password")
-    ap.add_argument("--db-name", help="DB name")
+    ap.add_argument("--db-path", required=True, help="SQLite DB file path")
     ap.add_argument("--db-table", default="daily_stop_hour", help="Target table name (default: daily_stop_hour)")
     ap.add_argument("--out-csv", default=None)
     args = ap.parse_args()
 
+    db_path = args.db_path
+    db_table = args.db_table
+
     d_yyyy_mm_dd = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
 
-    # 1) TPS스(대용량) 수집 → 필터
-    tpss_raw = fetch_tpss_for_date(args.tpss_key, args.date, Path("data/raw/api/tpss"))
-    tpss_raw = tpss_raw[tpss_raw["rte_id"].astype(str) == str(args.rte_id)]
-    tpss_long = melt_tpss_hourly(tpss_raw)  # [기준_날짜, rte_id, stop_id, stop_seq, 시간, 운행횟수]
+    # 1) TPS스(대용량) 수집 or 로드 from DB
+    conn = connect_sqlite(db_path)
+    # Ensure fact_ops_hourly_stop exists
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS fact_ops_hourly_stop (
+      date TEXT NOT NULL,
+      rte_id TEXT,
+      stop_id TEXT,
+      stop_seq INTEGER,
+      hour INTEGER,
+      ops INTEGER,
+      UNIQUE (date, rte_id, stop_id, hour)
+    );
+    """)
+    # Check if data for this date+rte_id exists
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1) FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?", (datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d"), str(args.rte_id)))
+    tpss_exists = cur.fetchone()[0] > 0
+    if tpss_exists:
+        # Load from DB
+        tpss_long = pd.read_sql_query(
+            "SELECT date as 기준_날짜, rte_id, stop_id, stop_seq, hour as 시간, ops as 운행횟수 FROM fact_ops_hourly_stop WHERE date=? AND rte_id=?",
+            conn,
+            params=(datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d"), str(args.rte_id))
+        )
+    else:
+        # Fetch from API, process, and store in DB
+        tpss_raw = fetch_tpss_for_date(args.tpss_key, args.date, Path("data/raw/api/tpss"))
+        tpss_raw = tpss_raw[tpss_raw["rte_id"].astype(str) == str(args.rte_id)]
+        tpss_long = melt_tpss_hourly(tpss_raw)  # [기준_날짜, rte_id, stop_id, stop_seq, 시간, 운행횟수]
+        upsert_fact_ops_hourly_sqlite(conn, tpss_long)
 
     # 2) 일별 정류장 총 승/하차 + 정류장명
     daily_stats = fetch_daily_stats_for_route(args.stats_key, args.date, args.route_no, Path("data/raw/api/CardBusStatisticsServiceNew"))
@@ -458,11 +551,12 @@ def main():
     if route_key is None:
         print("[warn] route_key(노선_ID)를 route_map에서 찾지 못했어요. 링크거리 조인은 skip(또는 직접 --route-id 추가 구현).")
 
-    # 5) 조립: tpss(시간대 운행횟수) + 일별 총량 + 월 가중치
+    # 5) 조립: fact_ops_hourly_stop(시간대 운행횟수) + 일별 총량 + 월 가중치
     #    - 시간 단위에 승/하차 분배
     #    - 정류장명 붙이기
     if tpss_long.empty:
         print("tpss 데이터가 비었습니다. 종료.")
+        conn.close()
         return
 
     # 정류장명(일별) 붙이기
@@ -525,38 +619,15 @@ def main():
     df = df[out_cols].sort_values(["기준_날짜","시간","정류장_순서","정류장_ID"])
 
     # ---- Save to DB (normalized + flat) ----
-    if args.db_host and args.db_user and args.db_name:
-        try:
-            conn = connect_mysql(
-                host=args.db_host,
-                port=args.db_port,
-                user=args.db_user,
-                password=args.db_pass if hasattr(args, "db-pass") else args.db_pass,
-                db=args.db_name,
-            )
-        except TypeError:
-            conn = connect_mysql(
-                host=args.db_host,
-                port=args.db_port,
-                user=args.db_user,
-                password=args.db_pass,
-                db=args.db_name,
-            )
-
-        # 4-1) 차원/팩트 테이블 생성 및 적재
-        create_dim_fact_tables_mysql(conn)
-        upsert_dim_route_map_mysql(conn, Path(args.route_map_csv))
-        upsert_dim_stop_link_mysql(conn, Path(args.link_csv))
-        upsert_fact_demand_daily_mysql(conn, daily_stats)
-        upsert_fact_demand_monthly_hourly_mysql(conn, monthly)
-
-        # 4-2) 최종 flat 뷰 테이블도 갱신 (API 쓰기 편하게)
-        create_flat_table_if_not_exists(conn, args.db_table)
-        upsert_dataframe(conn, args.db_table, df)
-        conn.close()
-        print(f"✅ upserted {len(df):,} rows into `{args.db_table}` and refreshed normalized tables on {args.db_host}")
-    else:
-        print("ℹ️ DB connection args not provided; skipping DB write.")
+    create_dim_fact_tables_sqlite(conn)
+    upsert_dim_route_map_sqlite(conn, Path(args.route_map_csv))
+    upsert_dim_stop_link_sqlite(conn, Path(args.link_csv))
+    upsert_fact_demand_daily_sqlite(conn, daily_stats)
+    upsert_fact_demand_monthly_hourly_sqlite(conn, monthly)
+    create_flat_table_if_not_exists(conn, db_table)
+    upsert_dataframe(conn, db_table, df)
+    conn.close()
+    print(f"✅ upserted {len(df):,} rows into `{db_table}` and refreshed normalized tables in SQLite DB {db_path}")
 
     # ---- Save to CSV (optional) ----
     if args.out_csv:
