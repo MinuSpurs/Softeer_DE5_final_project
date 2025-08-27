@@ -64,8 +64,8 @@
 
 
 ## 6) Tech Stack
-•	Data Source: 서울 열린데이터 광장 API, 기상 데이터(OpenWeather)
-•	Infra: AWS (S3, RDS MySQL, EC2, Lambda, EventBridge, CloudWatch, API Gateway)
-•	Processing: PySpark (ETL), Pandas
-•	Model: TensorFlow/Keras (LSTM)
-•	Dashboard: Streamlit (대시보드 시각화), API Gateway 연동
+-	Data Source: 서울 열린데이터 광장 API, 기상 데이터(OpenWeather)
+-	Infra: AWS (S3, RDS MySQL, EC2, Lambda, EventBridge, CloudWatch, API Gateway)
+-	Processing: PySpark (ETL), Pandas
+-	Model: TensorFlow/Keras (LSTM)
+-	Dashboard: Streamlit (대시보드 시각화), API Gateway 연동
