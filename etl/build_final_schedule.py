@@ -7,7 +7,6 @@ from pathlib import Path
 import sqlite3
 import argparse
 
-# ========= 설정 =========
 PRED_CSV = "/Users/minwoo/Desktop/softeer/data_engineering_course_materials/missions/final_project/data/172_LSTM_preds_정류장별_시간별_승하차_예측_혼잡도+추가배차.csv"
 LINK_CSV = "/Users/minwoo/Desktop/softeer/data_engineering_course_materials/missions/final_project/data/172_시간대별_정류장_노선_추정승하차+운행횟수+순서+링크거리.csv"  # 링크거리 CSV가 있으면 경로 문자열로 바꿔주세요. 없으면 None 그대로 두면 됩니다.
 DEFAULT_LINK_M = 300.0  # 링크거리 기본값(정류장_순서 1은 자동으로 0m)

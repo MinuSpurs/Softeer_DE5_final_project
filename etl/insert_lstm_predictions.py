@@ -1,23 +1,3 @@
-# save as: etl/insert_lstm_predictions.py
-"""
-LSTM 예측 CSV를 DB에 적재하고(선택: SQLite/MySQL), S3 업로드까지 지원.
-
-사용 예)
-# 1) SQLite 에 upsert + CSV를 S3로 업로드
-python etl/insert_lstm_predictions.py \
-  --csv-path data/172_LSTM_preds.csv \
-  --sqlite --db-path db/seoul_bus_172.db \
-  --s3-bucket seoul-bus-analytics --s3-prefix predictions/2025-06 --s3-upload-csv
-
-# 2) MySQL(RDS)에 upsert
-python etl/insert_lstm_predictions.py \
-  --csv-path data/172_LSTM_preds.csv \
-  --mysql \
-  --mysql-host bus-172.xxxxxx.ap-northeast-2.rds.amazonaws.com \
-  --mysql-db seoul_bus_172 \
-  --mysql-user admin --mysql-pass '*****'
-"""
-
 import argparse
 import os
 import sqlite3
@@ -25,15 +5,14 @@ from pathlib import Path
 
 import pandas as pd
 
-# boto3 / pymysql 은 선택 사용
 try:
-    import boto3  # type: ignore
-except Exception:  # pragma: no cover
+    import boto3  
+except Exception:  
     boto3 = None
 
 try:
-    import pymysql  # type: ignore
-except Exception:  # pragma: no cover
+    import pymysql 
+except Exception:  
     pymysql = None
 
 
@@ -243,7 +222,7 @@ def main():
     if args.sqlite:
         n = upsert_sqlite(Path(args.db_path), df)
         total_upserted += n
-        print(f"✅ SQLite upsert 완료: {n} rows → {args.db_path}")
+        print(f"SQLite upsert 완료: {n} rows → {args.db_path}")
 
     # MySQL upsert
     if args.mysql:
@@ -252,9 +231,8 @@ def main():
             raise ValueError(f"MySQL 접속 정보가 부족합니다: {miss}")
         n = upsert_mysql(args.mysql_host, args.mysql_db, args.mysql_user, args.mysql_pass, args.mysql_port, df)
         total_upserted += n
-        print(f"✅ MySQL upsert 완료: {n} rows → {args.mysql_host}/{args.mysql_db}.{TABLE_NAME}")
+        print(f"MySQL upsert 완료: {n} rows → {args.mysql_host}/{args.mysql_db}.{TABLE_NAME}")
 
-    # S3 업로드
     if args.s3_bucket and args.s3_upload_csv:
         key = f"{args.s3_prefix.rstrip('/')}/csv/{csv_path.name}"
         s3_upload(csv_path, args.s3_bucket, key)
@@ -269,7 +247,7 @@ def main():
         else:
             print("⚠️ SQLite DB 파일이 없어 S3 업로드를 건너뜁니다.")
 
-    print(f"✅ 총 upsert: {total_upserted} rows")
+    print(f"총 upsert: {total_upserted} rows")
     print("완료.")
 
 if __name__ == "__main__":
