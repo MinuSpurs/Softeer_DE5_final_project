@@ -1,21 +1,3 @@
-# lambda/lambda_reallocation.py
-# Purpose:
-# - Health check and simple read APIs from MySQL (RDS).
-# - Supports API Gateway HTTP API v2 (proxy) and direct Lambda invoke.
-#
-# Endpoints (intended):
-#   GET /v1/routes/{route}/days/{date}/summary
-#   GET /v1/routes/{route}/days/{date}/stops/{stop_seq}
-#   GET /v1/routes/{route}/forecast?start=YYYY-MM-DD&days=N
-#
-# Query-string fallback also supported:
-#   /summary?route_no=172&date=2025-06-23
-#   /stops?route_no=172&date=2025-06-23&stop_seq=1
-#   /forecast?route_no=172&start=2025-06-24&days=7
-#
-# Env Vars required:
-#   DB_HOST, DB_USER, DB_PASS, DB_NAME [, DB_PORT]
-#
 import os
 import json
 import logging
@@ -441,6 +423,3 @@ def handler(event, context):
             return _server_error(str(e))
         return {"ok": False, "error": str(e)}
 
-# Usage examples (API Gateway or direct invoke):
-#   POST/GET /v1/ingest?s3_bucket=seoul-bus-analytics&s3_key=predictions/172_LSTM_preds_2025-06-23.csv
-#   POST body: {"action":"ingest","date":"2025-06-23"}  # builds key from S3_PREFIX + pattern

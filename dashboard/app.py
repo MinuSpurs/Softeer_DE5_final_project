@@ -1,4 +1,3 @@
-# /Users/minwoo/Desktop/softeer/DE5_Final_project/dashboard/app.py
 import pandas as pd
 import streamlit as st
 from datetime import date, timedelta

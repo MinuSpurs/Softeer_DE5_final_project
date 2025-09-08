@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import argparse
 import os
 from pathlib import Path
@@ -8,15 +7,12 @@ from datetime import datetime, timedelta
 import pandas as pd
 import time
 
-# S3 (optional)
 try:
     import boto3
 except Exception:
     boto3 = None
 
-# ----------------------------
-# 유틸
-# ----------------------------
+
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -35,7 +31,7 @@ def to_int_safe(v, default=0):
         return default
 
 # ----------------------------
-# API 호출 (requests 없이 urllib 사용: 표준 라이브러리)
+# API 호출
 # ----------------------------
 from urllib.request import urlopen
 from urllib.parse import quote
@@ -75,11 +71,10 @@ def fetch_url(url: str, timeout: float = 10.0, max_retries: int = 3, backoff: fl
     raise RuntimeError(f"fetch_url exhausted retries: url={url}, last_err={last_err}")
 
 def _q(x):
-    # quote path segment safely (handles non-ASCII like API keys or route numbers)
     return quote(str(x), safe="")
 
 # ----------------------------
-# S3 helpers (optional)
+# S3 helpers
 # ----------------------------
 def _s3_client():
     if boto3 is None:
@@ -432,9 +427,9 @@ def main():
                 _s3_upload_file(s3, args.s3_bucket, p, key)
 
     conn.close()
-    print(f"✅ SQLite DB: {args.db_path}")
-    print(f"✅ SQL Dump  : {args.dump_sql_path}")
-    print("✅ Raw XML   : data/raw/api/... 에 저장됨")
+    print(f"SQLite DB: {args.db_path}")
+    print(f"SQL Dump  : {args.dump_sql_path}")
+    print("Raw XML   : data/raw/api/... 에 저장됨")
 
 if __name__ == "__main__":
     main()

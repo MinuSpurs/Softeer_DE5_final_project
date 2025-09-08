@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Bronze Parquet에서 wide → long 변환
-# 컬럼: [기준_날짜, 노선_ID, 정류장_ID, 정류장_순서, 노선번호, 시간, 운행횟수]
-# 저장: s3://.../silver/ops_hourly/use_ym=YYYYMM/route_no=172/date=YYYYMMDD
+
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import expr, regexp_replace, col, lit, sequence, to_timestamp, explode, array
@@ -24,8 +22,6 @@ bronze = spark.read.parquet(S3_BRONZE).where(col("use_ym") == USE_YM).where(col(
 # 시간대 컬럼 이름들
 hour_cols = [f"버스운행횟수_{h:02d}시" for h in range(24) if f"버스운행횟수_{h:02d}시" in bronze.columns]
 
-# wide → long
-# 방법: array(zip(시간, 값)) → explode
 pairs = array(*[
     expr(f"named_struct('hour',{h}, '운행횟수', cast(`버스운행횟수_{h:02d}시` as double))")
     for h in range(24) if f"버스운행횟수_{h:02d}시" in bronze.columns
@@ -50,5 +46,5 @@ long_df = (
       .parquet(S3_SILVER)
 )
 
-print("✅ silver saved:", S3_SILVER)
+print("silver saved:", S3_SILVER)
 spark.stop()
