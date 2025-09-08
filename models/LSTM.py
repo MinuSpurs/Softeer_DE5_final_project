@@ -1,6 +1,3 @@
-# save as: /Users/minwoo/Desktop/softeer/data_engineering_course_materials/missions/final_project/LSTM_v1.py
-# 목적: 정류장×시간 승차 수요 예측 (공급 피처 주입 버전)
-
 import os
 import numpy as np
 import pandas as pd
@@ -26,7 +23,7 @@ VAL_END     = "2025-06-21"
 TEST_START  = "2025-06-22"
 TEST_END    = "2025-06-29"
 
-SEQ_LEN = 24   # 24시간 히스토리 입력
+SEQ_LEN = 24  
 BATCH   = 256
 EPOCHS  = 100
 LR      = 1e-3
@@ -60,7 +57,6 @@ df["하차인원"] = df["하차인원"].fillna(0).clip(lower=0)
 
 # 링크거리 피처
 if "링크_구간거리(m)" in df.columns:
-    # 0은 실질적 결측으로 간주 → 평균 대체
     mean_nonzero = df.loc[df["링크_구간거리(m)"].replace(0, np.nan).notna(),"링크_구간거리(m)"] \
                      .replace(0, np.nan).mean()
     df["링크거리"] = df["링크_구간거리(m)"].replace(0, np.nan).fillna(mean_nonzero)
@@ -114,7 +110,6 @@ test_mask = (
 # --------------------------
 # 2) 시퀀스 빌더 (정류장별로 24시간 히스토리 → t 시점 예측)
 # --------------------------
-# ✅ 공급 피처 포함
 feat_cols = [
     "hour","dow","is_wend",
     "정류장_순서","링크거리",
@@ -214,7 +209,6 @@ pred_df["시간"] = pred_df["timestamp"].dt.hour
 join_cols = ["정류장_ID","기준_날짜","시간"]
 meta = test_df[join_cols + ["정류장_순서","역명","통과버스수"]].drop_duplicates()
 
-# 🔧 키 타입 정규화: 정류장_ID/기준_날짜/시간의 dtype을 맞춘다
 meta = meta.copy()
 meta["정류장_ID"] = meta["정류장_ID"].astype(str)
 meta["기준_날짜"] = pd.to_datetime(meta["기준_날짜"]).dt.strftime("%Y-%m-%d")
@@ -255,4 +249,4 @@ out = out.sort_values(["기준_날짜","시간","정류장_순서"]).reset_index
 os.makedirs("data/preds", exist_ok=True)
 csv_path = "data/preds/lstm_preds.csv"
 out.to_csv(csv_path, index=False, encoding="utf-8-sig")
-print("✅ 예측 결과가 CSV 파일로 저장되었습니다:", csv_path)
+print("예측 결과가 CSV 파일로 저장되었습니다:", csv_path)

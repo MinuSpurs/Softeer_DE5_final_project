@@ -1,20 +1,5 @@
 # -*- coding: utf-8 -*-
 # Silver의 ops_hourly를 읽어 API가 필요로 하는 요약을 MySQL에 적재.
-# 테이블:
-#   api_hour_summary(route_no, date, hour, current_departures)
-#   api_stop_hour_detail(route_no, date, stop_id, stop_seq, hour, departures)
-#
-# ※ 처음 한 번 수동으로 스키마 생성(EC2에서 mysql 접속 후):
-# CREATE DATABASE seoul_bus_172;
-# USE seoul_bus_172;
-# CREATE TABLE IF NOT EXISTS api_hour_summary(
-#   route_no VARCHAR(16), date CHAR(8), hour INT, current_departures DOUBLE,
-#   PRIMARY KEY(route_no, date, hour)
-# );
-# CREATE TABLE IF NOT EXISTS api_stop_hour_detail(
-#   route_no VARCHAR(16), date CHAR(8), stop_id VARCHAR(32), stop_seq INT, hour INT, departures DOUBLE,
-#   PRIMARY KEY(route_no, date, stop_id, hour)
-# );
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, sum as _sum
@@ -25,9 +10,9 @@ USE_YM    = os.getenv("USE_YM",     "202506")
 ROUTE_NO  = os.getenv("ROUTE_NO",   "172")
 
 # JDBC (환경변수로 관리)
-JDBC_URL  = os.getenv("JDBC_URL")   # e.g. jdbc:mysql://bus-172.xxxx.ap-northeast-2.rds.amazonaws.com:3306/seoul_bus_172?useSSL=false
-DB_USER   = os.getenv("DB_USER")    # admin
-DB_PASS   = os.getenv("DB_PASS")    # ****
+JDBC_URL  = os.getenv("JDBC_URL") 
+DB_USER   = os.getenv("DB_USER")   
+DB_PASS   = os.getenv("DB_PASS")    
 DB_DRIVER = "com.mysql.cj.jdbc.Driver"
 
 spark = (
@@ -88,5 +73,5 @@ stop_detail = (
       .save()
 )
 
-print("✅ gold published to MySQL")
+print("gold published to MySQL")
 spark.stop()

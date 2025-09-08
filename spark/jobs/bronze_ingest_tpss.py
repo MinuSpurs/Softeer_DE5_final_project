@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # 원천 TPSS CSV(넓은 형태: 버스운행횟수_00시~23시)를 S3에서 읽어
 # S3 Parquet(Bronze)로 저장. 날짜/노선 필터도 즉석에서 가능.
 
@@ -11,8 +10,8 @@ S3_INPUT  = os.getenv("S3_TPSS_CSV",  "s3://seoul-bus-analytics/uploads/tpss/202
 S3_OUTPUT = os.getenv("S3_BRONZE",    "s3://seoul-bus-analytics/bronze/tpss")
 
 # 필터
-USE_YM_FILTER   = os.getenv("USE_YM", "202506")    # 2025-06
-ROUTE_NO_FILTER = os.getenv("ROUTE_NO", "172")     # 172
+USE_YM_FILTER   = os.getenv("USE_YM", "202506")    
+ROUTE_NO_FILTER = os.getenv("ROUTE_NO", "172")  
 
 spark = (
     SparkSession.builder
@@ -29,7 +28,6 @@ df = (
 
 # 컬럼 정규화: 노선번호/노선_ID/정류장_ID/정류장_순서/기준_날짜 등 네이밍 통일
 # 아래 컬럼명은 네 파일 스키마에 맞게 조정
-# 예시: [기준_날짜, 노선_ID, 정류장_ID, 정류장_순서, 노선번호, 버스운행횟수_00시 ... 23시]
 df = (
     df
     .withColumn("기준_날짜", trim(col("기준_날짜")))
@@ -55,5 +53,5 @@ df = df.withColumn("date",   regexp_replace(col("기준_날짜"), "-", ""))
       .parquet(S3_OUTPUT)
 )
 
-print("✅ bronze saved:", S3_OUTPUT)
+print("bronze saved:", S3_OUTPUT)
 spark.stop()

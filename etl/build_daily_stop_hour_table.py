@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import argparse
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -17,7 +16,7 @@ try:
 except Exception:
     boto3 = None
 
-def q(x):  # URL 세그먼트 안전 인코딩
+def q(x):  
     return quote(str(x), safe="")
 
 def fetch(url: str) -> str:
@@ -27,12 +26,10 @@ def fetch(url: str) -> str:
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-# 환경변수 읽기 유틸
 def getenv_default(name: str, default=None):
     v = os.getenv(name)
     return v if v not in (None, "") else default
 
-# ---- Simple ETL audit (SQLite) ----
 def ensure_audit_table_sqlite(conn):
     conn.execute("""
     CREATE TABLE IF NOT EXISTS etl_run_audit (
