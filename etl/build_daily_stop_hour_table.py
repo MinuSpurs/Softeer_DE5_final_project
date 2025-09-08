@@ -10,6 +10,12 @@ import pandas as pd
 from datetime import datetime
 import sqlite3
 import os
+import io
+import sys
+try:
+    import boto3
+except Exception:
+    boto3 = None
 
 def q(x):  # URL 세그먼트 안전 인코딩
     return quote(str(x), safe="")
@@ -25,6 +31,52 @@ def ensure_dir(p: Path):
 def getenv_default(name: str, default=None):
     v = os.getenv(name)
     return v if v not in (None, "") else default
+
+# ---- Simple ETL audit (SQLite) ----
+def ensure_audit_table_sqlite(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS etl_run_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_name TEXT NOT NULL,
+      target_date TEXT NOT NULL,  -- YYYYMMDD
+      status TEXT NOT NULL,       -- OK / SKIPPED_SAME_DATE / NO_DATA / ERROR
+      message TEXT,
+      created_at TEXT NOT NULL    -- ISO timestamp
+    );
+    """)
+    conn.commit()
+
+def get_last_target_date_sqlite(conn, job_name: str):
+    cur = conn.cursor()
+    cur.execute("""
+      SELECT target_date
+      FROM etl_run_audit
+      WHERE job_name = ?
+      ORDER BY id DESC
+      LIMIT 1
+    """, (job_name,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def append_audit_sqlite(conn, job_name: str, target_date: str, status: str, message: str = None):
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+      INSERT INTO etl_run_audit (job_name, target_date, status, message, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    """, (job_name, target_date, status, message, ts))
+    conn.commit()
+
+# ---- S3 Upload Helper ----
+def s3_upload_bytes(bucket: str, key: str, data: bytes, content_type: str = "text/csv"):
+    """
+    Upload raw bytes to S3. Requires that boto3 is available and credentials/role are configured.
+    """
+    if not boto3:
+        print("[warn] boto3 not available; skip S3 upload.")
+        return
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+    print(f"✅ uploaded to s3://{bucket}/{key}")
 
 # -----------------------------
 # 1) tpssStationRouteTurn (대용량, 날짜만 파라미터 / route 필터는 로컬에서)
@@ -646,10 +698,27 @@ def main():
     ap.add_argument("--db-table", default="daily_stop_hour", help="Target table name (default: daily_stop_hour)")
     ap.add_argument("--tpss-csv", default=None, help="(선택) tpssStationRouteTurn을 대신할 로컬 CSV 경로")
     ap.add_argument("--out-csv", default=None)
+    ap.add_argument("--s3-bucket", default=getenv_default("S3_BUCKET"), help="(선택) 업로드할 S3 버킷명. 환경변수 S3_BUCKET 사용 가능")
+    ap.add_argument("--s3-prefix", default=getenv_default("S3_PREFIX", "processed"), help="(선택) S3 키 prefix (기본: processed)")
     args = ap.parse_args()
 
     db_path = args.db_path
     db_table = args.db_table
+
+    # ---- Audit: skip if target date equals previous run's target ----
+    job_name = getenv_default("JOB_NAME", "build_daily_stop_hour_table")
+    # We'll open a lightweight connection first only for audit check
+    conn_audit = connect_sqlite(db_path)
+    ensure_audit_table_sqlite(conn_audit)
+    last_target = get_last_target_date_sqlite(conn_audit, job_name)
+    if last_target is not None and str(last_target) == str(args.date):
+        msg = f"[error] target date {args.date} is identical to previous run; skip execution."
+        print(msg, file=sys.stderr)
+        append_audit_sqlite(conn_audit, job_name, str(args.date), "SKIPPED_SAME_DATE", msg)
+        conn_audit.close()
+        return
+    # keep this audit connection to append final status later if you prefer, or close it now:
+    conn_audit.close()
 
     d_yyyy_mm_dd = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
 
@@ -661,6 +730,8 @@ def main():
 
     # 1) TPS스(대용량) 수집/로드
     conn = connect_sqlite(db_path)
+    # ensure audit table exists on the main connection too (so we can log outcomes)
+    ensure_audit_table_sqlite(conn)
     # Ensure fact_ops_hourly_stop exists
     conn.execute("""
     CREATE TABLE IF NOT EXISTS fact_ops_hourly_stop (
@@ -727,6 +798,10 @@ def main():
     #    - 정류장명 붙이기
     if tpss_long.empty:
         print("tpss 데이터가 비었습니다. 종료.")
+        try:
+            append_audit_sqlite(conn, getenv_default("JOB_NAME", "build_daily_stop_hour_table"), str(args.date), "NO_DATA", "tpss empty")
+        except Exception:
+            pass
         conn.close()
         return
 
@@ -870,6 +945,23 @@ def main():
     upsert_dataframe(conn, db_table, df)
     affected = len(df)
     conn.close()
+
+    # ---- Upload to S3 (optional) ----
+    if affected > 0 and args.s3_bucket:
+        # Key: {prefix}/daily_stop_hour/route={route_no}/date={date}.csv
+        prefix = (args.s3_prefix or "processed").rstrip("/")
+        s3_key = f"{prefix}/daily_stop_hour/route={args.route_no}/date={args.date}.csv"
+        buf = io.StringIO()
+        df.to_csv(buf, index=False, encoding="utf-8-sig")
+        s3_upload_bytes(args.s3_bucket, s3_key, buf.getvalue().encode("utf-8-sig"), content_type="text/csv; charset=utf-8")
+
+    try:
+        if affected > 0:
+            append_audit_sqlite(conn, getenv_default("JOB_NAME", "build_daily_stop_hour_table"), str(args.date), "OK", f"rows={affected}")
+        else:
+            append_audit_sqlite(conn, getenv_default("JOB_NAME", "build_daily_stop_hour_table"), str(args.date), "NO_DATA", "no rows affected")
+    except Exception:
+        pass
     if affected > 0:
         print(f"✅ upserted {affected:,} rows into `{db_table}` and refreshed normalized tables in SQLite DB {db_path}")
     else:

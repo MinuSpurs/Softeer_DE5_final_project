@@ -10,9 +10,11 @@ db/
 /temp/
 __pycache__/
 *.pyc
+/trash/
 
 # lambda build artifacts
 lambda/.venv/
 lambda/.python_packages/
 
 sql/
+*.pem

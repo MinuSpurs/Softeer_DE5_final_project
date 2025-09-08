@@ -1,3 +1,5 @@
+import os
+import io
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -44,6 +46,25 @@ CREATE TABLE IF NOT EXISTS fact_final_allocation (
   crowding TEXT
 );
 """
+
+# ========= 선택적 S3 업로더 =========
+def _get_boto3():
+    try:
+        import boto3  # type: ignore
+        return boto3
+    except Exception:
+        return None
+
+def upload_df_to_s3(df: pd.DataFrame, bucket: str, key: str, index: bool = False, encoding: str = "utf-8-sig"):
+    boto3 = _get_boto3()
+    if not boto3 or not bucket or not key:
+        return False
+    buf = io.StringIO()
+    df.to_csv(buf, index=index, encoding=encoding)
+    body = buf.getvalue().encode("utf-8-sig") if encoding == "utf-8-sig" else buf.getvalue().encode("utf-8")
+    s3 = boto3.client("s3")
+    s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="text/csv; charset=utf-8")
+    return True
 
 # ========= 속도 프로파일 (m/min) =========
 def speed_m_per_min(h):
@@ -169,7 +190,7 @@ def propagate_schedule(departures: pd.DataFrame,
     return pd.DataFrame(rows)
 
 # ========= 하루 처리 =========
-def process_one_day(date_str: str, conn, table_schedule, table_alloc):
+def process_one_day(date_str: str, conn, table_schedule, table_alloc, s3_bucket: str = "", s3_prefix: str = "processed"):
     day = pred[pred["기준_날짜"] == date_str].copy()
     if day.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -256,11 +277,17 @@ def process_one_day(date_str: str, conn, table_schedule, table_alloc):
     alloc["총수요(근사)"] = alloc["총승차"]  # 보고용 (필요시 총승차+총하차로 변경)
     alloc["링크거리_소스"] = ("LINK_CSV" if LINK_CSV else f"default({DEFAULT_LINK_M:.0f}m)")
 
-    # 저장
+    # 로컬 저장
     sch_path = f"{OUT_DIR}/172_버스단위_스케줄_{date_str}.csv"
     alloc_path = f"{OUT_DIR}/172_버스단위_스케줄+수요분배_{date_str}.csv"
     schedule.to_csv(sch_path, index=False, encoding="utf-8-sig")
     alloc.to_csv(alloc_path, index=False, encoding="utf-8-sig")
+
+    # S3 업로드 (옵션)
+    if s3_bucket:
+        base_prefix = s3_prefix.rstrip("/")
+        upload_df_to_s3(schedule, s3_bucket, f"{base_prefix}/final_schedule/route=172/date={date_str}.csv")
+        upload_df_to_s3(alloc,    s3_bucket, f"{base_prefix}/final_allocation/route=172/date={date_str}.csv")
 
     # DB 저장
     cur = conn.cursor()
@@ -310,10 +337,12 @@ def process_one_day(date_str: str, conn, table_schedule, table_alloc):
     return schedule, alloc
 
 def main():
-    parser = argparse.ArgumentParser(description="Build final bus schedule and save to CSV and SQLite DB.")
+    parser = argparse.ArgumentParser(description="Build final bus schedule and save to CSV/SQLite/S3.")
     parser.add_argument("--db-path", type=str, required=True, help="Path to SQLite database file.")
     parser.add_argument("--table-schedule", type=str, default="fact_final_schedule", help="Table name for schedule data.")
     parser.add_argument("--table-alloc", type=str, default="fact_final_allocation", help="Table name for allocation data.")
+    parser.add_argument("--s3-bucket", type=str, default=os.getenv("S3_BUCKET",""), help="S3 bucket to upload outputs.")
+    parser.add_argument("--s3-prefix", type=str, default=os.getenv("S3_PREFIX","processed"), help="S3 prefix (folder) base.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db_path)
@@ -323,7 +352,7 @@ def main():
 
     all_sch, all_alloc = [], []
     for d in days:
-        sch, alc = process_one_day(d, conn, args.table_schedule, args.table_alloc)
+        sch, alc = process_one_day(d, conn, args.table_schedule, args.table_alloc, args.s3_bucket, args.s3_prefix)
         if not sch.empty:
             all_sch.append(sch)
         if not alc.empty:
@@ -333,12 +362,18 @@ def main():
         msch = pd.concat(all_sch, ignore_index=True)
         msch_path = f"{OUT_DIR}/172_버스단위_스케줄_{START_DATE}_to_{END_DATE}.csv"
         msch.to_csv(msch_path, index=False, encoding="utf-8-sig")
+        # S3 업로드
+        if args.s3_bucket:
+            upload_df_to_s3(msch, args.s3_bucket, f"{args.s3_prefix.rstrip('/')}/final_schedule/monthly/route=172/{START_DATE}_to_{END_DATE}.csv")
         print("✅ 월간 스케줄 저장:", msch_path)
 
     if all_alloc:
         malc = pd.concat(all_alloc, ignore_index=True)
         malc_path = f"{OUT_DIR}/172_버스단위_스케줄+수요분배_{START_DATE}_to_{END_DATE}.csv"
         malc.to_csv(malc_path, index=False, encoding="utf-8-sig")
+        # S3 업로드
+        if args.s3_bucket:
+            upload_df_to_s3(malc, args.s3_bucket, f"{args.s3_prefix.rstrip('/')}/final_allocation/monthly/route=172/{START_DATE}_to_{END_DATE}.csv")
         print("✅ 월간 스케줄+수요분배 저장:", malc_path)
 
     conn.close()

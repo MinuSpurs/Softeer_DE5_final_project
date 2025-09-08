@@ -1,13 +1,6 @@
-
-
 # AWS Lambda Python 3.10 base image
-FROM public.ecr.aws/lambda/python:3.10
-
-# Basic envs
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Lambda task working directory
+FROM public.ecr.aws/lambda/python:3.10-arm64
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /var/task
 
 # -----------------------------
